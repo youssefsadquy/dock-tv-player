@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dock Spotify player</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #080c10; color: #f4f7f8;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  #wrap { padding: 34px 42px 26px; box-sizing: border-box; height: 100%; overflow: auto; }
+  h1 { margin: 0 0 16px; font-size: 38px; font-weight: 600; color: #1ed760; }
+  .row { margin: 6px 0; font-size: 24px; line-height: 1.35; }
+  .label { color: #9fb0b8; }
+  .ok { color: #1ed760; }
+  .bad { color: #ff6b6b; }
+  .wait { color: #ffc857; }
+  #status { margin: 18px 0 22px; padding: 16px 20px; border: 1px solid #2b3a42; border-radius: 10px; background: #10171c; }
+  #log {
+    margin: 0; padding: 16px 20px; min-height: 180px; max-height: 52vh;
+    overflow: auto; white-space: pre-wrap; word-wrap: break-word;
+    background: #0b1115; border: 1px solid #223038; border-radius: 10px;
+    font-family: Consolas, "Courier New", monospace; font-size: 20px; line-height: 1.45;
+    color: #d7e2e7;
+  }
+  #activate {
+    margin-top: 18px; padding: 14px 26px; font-size: 24px;
+    background: #1ed760; color: #06140a; border: 0; border-radius: 8px;
+    font-weight: 700;
+  }
+  #activate:focus { outline: 4px solid #fff; outline-offset: 3px; }
+  #hint { margin-top: 16px; font-size: 22px; color: #9fb0b8; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>Dock Spotify player</h1>
+
+  <div id="status">
+    <div class="row"><span class="label">Secure context:</span> <span id="secure">checking</span></div>
+    <div class="row"><span class="label">SDK script:</span> <span id="sdk">loading</span></div>
+    <div class="row"><span class="label">Widevine:</span> <span id="widevine">checking</span></div>
+    <div class="row"><span class="label">Player:</span> <span id="playerState">waiting</span></div>
+    <div class="row"><span class="label">Device ID:</span> <span id="deviceId">-</span></div>
+    <div class="row"><span class="label">Playback:</span> <span id="playback">-</span></div>
+  </div>
+
+  <pre id="log"></pre>
+  <button id="activate" type="button">Activate audio</button>
+  <div id="hint">Press Back on the TV remote to close this status screen.</div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var logEl = document.getElementById('log');
+  var secureEl = document.getElementById('secure');
+  var sdkEl = document.getElementById('sdk');
+  var widevineEl = document.getElementById('widevine');
+  var playerEl = document.getElementById('playerState');
+  var deviceEl = document.getElementById('deviceId');
+  var playbackEl = document.getElementById('playback');
+  var activateEl = document.getElementById('activate');
+
+  var token = null;
+  var tokenWaiters = [];
+  var tokenRequestPending = false;
+  var visible = false;
+  var sdkReady = false;
+  var player = null;
+  var creating = false;
+  var sawSdk = false;
+
+  function stamp() {
+    var d = new Date();
+    function p(n) { return n < 10 ? '0' + n : '' + n; }
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  function log(text) {
+    logEl.textContent += '[' + stamp() + '] ' + text + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+    try { console.log('[DockSpotifySDK] ' + text); } catch (e) { }
+  }
+
+  function set(el, text, cls) {
+    el.textContent = text;
+    el.className = cls || '';
+  }
+
+  function send(data) {
+    try { window.parent.postMessage(data, '*'); } catch (e) { }
+  }
+
+  function checkEme() {
+    if (!navigator.requestMediaKeySystemAccess) {
+      set(widevineEl, 'requestMediaKeySystemAccess is missing', 'bad');
+      log('EME: navigator.requestMediaKeySystemAccess is missing');
+      return;
+    }
+    var config = [{
+      initDataTypes: ['cenc'],
+      audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }]
+    }];
+    navigator.requestMediaKeySystemAccess('com.widevine.alpha', config).then(function () {
+      set(widevineEl, 'available', 'ok');
+      log('Widevine: available');
+    }, function (err) {
+      set(widevineEl, 'NOT available', 'bad');
+      log('Widevine: NOT available: ' + (err && err.message ? err.message : err));
+    });
+  }
+
+  function requestToken() {
+    if (tokenRequestPending) return;
+    tokenRequestPending = true;
+    send({ type: 'need-token' });
+    log('Asked Dock for an access token');
+  }
+
+  function getOAuthToken(cb) {
+    // Always ask Dock. Its token cache refreshes shortly before expiry, so this also
+    // covers the refresh call the SDK makes after the first token has expired.
+    tokenWaiters.push(cb);
+    requestToken();
+  }
+
+  function createPlayer() {
+    if (player || creating) return;
+    if (!token) { log('Waiting for a token before creating the player'); return; }
+    if (!sdkReady || !window.Spotify) { log('Waiting for the Spotify SDK before creating the player'); return; }
+    creating = true;
+    set(playerEl, 'creating', 'wait');
+    log('Creating Spotify.Player');
+
+    player = new window.Spotify.Player({
+      name: 'Dock TV',
+      getOAuthToken: getOAuthToken,
+      volume: 0.8
+    });
+
+    player.addListener('initialization_error', function (e) {
+      set(playerEl, 'initialization_error', 'bad');
+      log('initialization_error: ' + (e && e.message ? e.message : e));
+    });
+
+    player.addListener('authentication_error', function (e) {
+      set(playerEl, 'authentication_error', 'bad');
+      log('authentication_error: ' + (e && e.message ? e.message : e));
+    });
+
+    player.addListener('account_error', function (e) {
+      set(playerEl, 'account_error', 'bad');
+      log('account_error: ' + (e && e.message ? e.message : e));
+    });
+
+    player.addListener('playback_error', function (e) {
+      set(playerEl, 'playback_error', 'bad');
+      log('playback_error: ' + (e && e.message ? e.message : e));
+    });
+
+    player.addListener('autoplay_failed', function () {
+      set(playerEl, 'autoplay blocked - press Activate', 'wait');
+      log('autoplay_failed: waiting for a user gesture');
+    });
+
+    player.addListener('ready', function (e) {
+      set(playerEl, 'READY', 'ok');
+      set(deviceEl, e.device_id || '-', 'ok');
+      log('READY device_id=' + (e.device_id || ''));
+      send({ type: 'ready', deviceId: e.device_id || '' });
+    });
+
+    player.addListener('not_ready', function (e) {
+      set(playerEl, 'not_ready', 'wait');
+      log('not_ready device_id=' + (e.device_id || ''));
+    });
+
+    player.addListener('player_state_changed', function (state) {
+      if (!state || !state.track_window || !state.track_window.current_track) {
+        set(playbackEl, 'no track', '');
+        return;
+      }
+      var t = state.track_window.current_track;
+      var artist = '';
+      if (t.artists && t.artists.length) artist = t.artists[0].name || '';
+      set(playbackEl, t.name + (artist ? ' - ' + artist : '') + (state.paused ? ' (paused)' : ' (playing)'), 'ok');
+      log('state: ' + t.name + (artist ? ' / ' + artist : '') + ' paused=' + state.paused);
+    });
+
+    player.connect().then(function (connected) {
+      log('player.connect() resolved: ' + connected);
+      if (connected) {
+        set(playerEl, 'connected, waiting for ready', 'wait');
+      } else {
+        set(playerEl, 'connect failed', 'bad');
+      }
+    }, function (err) {
+      set(playerEl, 'connect error', 'bad');
+      log('player.connect() rejected: ' + (err && err.message ? err.message : err));
+    });
+  }
+
+  window.addEventListener('message', function (event) {
+    if (!window.__dockMessageOriginSeen) {
+      window.__dockMessageOriginSeen = true;
+      log('message origin=' + event.origin);
+    }
+    var data = event.data || {};
+    if (data.type === 'token' && data.token) {
+      token = data.token;
+      tokenRequestPending = false;
+      log('Received an access token');
+      var waiters = tokenWaiters;
+      tokenWaiters = [];
+      for (var i = 0; i < waiters.length; i++) {
+        try { waiters[i](token); } catch (e) { log('token callback error: ' + e); }
+      }
+      createPlayer();
+    } else if (data.type === 'token-error') {
+      tokenRequestPending = false;
+      log('Dock could not get an access token');
+      set(playerEl, 'no token', 'bad');
+    } else if (data.type === 'activate') {
+      activate();
+    } else if (data.type === 'show') {
+      visible = true;
+      try { activateEl.focus(); } catch (e) { }
+      log('Status screen opened');
+    } else if (data.type === 'hide') {
+      visible = false;
+      try { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); } catch (e) { }
+      log('Status screen closed');
+    }
+  });
+
+  function activate() {
+    if (!player) { log('Activate pressed before the player exists'); return; }
+    try {
+      var result = player.activateElement();
+      if (result && result.catch) {
+        result.catch(function (err) { log('activateElement rejected: ' + (err && err.message ? err.message : err)); });
+      }
+      log('player.activateElement() called');
+    } catch (e) {
+      log('activateElement error: ' + e);
+    }
+  }
+
+  activateEl.addEventListener('click', activate);
+
+  document.addEventListener('keydown', function (e) {
+    if (e.keyCode === 10009 || e.keyCode === 27) {
+      if (visible) send({ type: 'close' });
+      return;
+    }
+    if (visible) activate();
+  });
+
+  // Define this before the SDK script is loaded.
+  window.onSpotifyWebPlaybackSDKReady = function () {
+    sdkReady = true;
+    sawSdk = true;
+    set(sdkEl, 'loaded', 'ok');
+    log('Spotify Web Playback SDK is ready');
+    send({ type: 'sdk-ready' });
+    createPlayer();
+  };
+
+  var secure = false;
+  try { secure = window.isSecureContext === true; } catch (e) { }
+  set(secureEl, secure ? 'yes' : 'NO', secure ? 'ok' : 'bad');
+  log('origin=' + location.origin + ' isSecureContext=' + window.isSecureContext);
+  log('userAgent=' + navigator.userAgent);
+  log('MediaSource=' + (typeof window.MediaSource) + ' WebSocket=' + (typeof window.WebSocket) +
+      ' EME=' + (typeof navigator.requestMediaKeySystemAccess));
+  checkEme();
+
+  send({ type: 'hello' });
+
+  // If the first token could not be fetched (Wi-Fi was down, for example), keep asking.
+  setInterval(function () {
+    if (!player) requestToken();
+  }, 20000);
+
+  // The SDK script is loaded after the inline handlers above.
+  var script = document.createElement('script');
+  script.src = 'https://sdk.scdn.co/spotify-player.js';
+  script.async = true;
+  script.onerror = function () {
+    set(sdkEl, 'script failed to load', 'bad');
+    log('Failed to load https://sdk.scdn.co/spotify-player.js');
+  };
+  document.body.appendChild(script);
+
+  setTimeout(function () {
+    if (!sawSdk) {
+      set(sdkEl, 'not ready after 15s', 'bad');
+      log('The SDK script did not call onSpotifyWebPlaybackSDKReady within 15 seconds');
+    }
+  }, 15000);
+})();
+</script>
+</body>
+</html>
